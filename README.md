@@ -41,19 +41,6 @@ measure, so you can see what the radar sees.
 Open the printed URL on your phone, enter the device hostname and the room
 length from the sensor to the far wall, and follow the instructions.
 
-Reload-safe: the hostname and length are kept in the URL, so a reload
-reconnects without retyping.
-
-## Notes
-
-- Thresholds live in the radar module's own flash. Reflashing the ESP does
-  not undo them. The ESPHome "Factory Reset" button restores defaults.
-- The proposed threshold is the empty-room maximum plus a fixed offset of
-  10, clamped to 100. A multiplier was rejected because near gates idle at
-  40 to 60 still energy.
-- Writes to Timeout and the two max gate numbers make ESPHome restart the
-  module; the script waits that out and re-verifies each one, because a
-  write sent during the restart is silently lost.
 
 ## License
 
