@@ -727,6 +727,11 @@ PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LD2410 calibration</title>
+<!-- An empty data URI stops the browser asking for /favicon.ico, which the
+     server has no answer for. Declaring it here rather than adding a route
+     means there is no request at all, and _send_bytes keeps its single
+     hardcoded 200 status instead of growing a 204 case for one icon. -->
+<link rel="icon" href="data:,">
 <style>
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
