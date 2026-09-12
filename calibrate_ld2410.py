@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 import json
 import math
 import socket
@@ -86,13 +86,14 @@ class DeviceError(Exception):
 @dataclass
 class Entity:
     entity_id: str
+    name_id: str
     name: str
     value: float | bool | str | None
     state: str | None
 
 
 def object_id(entity_id: str) -> str:
-    """Strip the domain prefix, because web API URLs use the short object id."""
+    """Strip the domain prefix, so log lines can name an entity briefly."""
     return entity_id.split("-", 1)[1]
 
 
@@ -200,6 +201,7 @@ class Device:
             value = float(value)
         entity = Entity(
             entity_id=entity_id,
+            name_id=payload["name_id"],
             name=name,
             value=value,
             state=payload.get("state"),
@@ -216,11 +218,26 @@ class Device:
 
     def switch(self, entity_id: str, on: bool) -> None:
         action = "turn_on" if on else "turn_off"
-        self._control_request("POST", f"/switch/{object_id(entity_id)}/{action}")
+        self._control_request("POST", f"/{self.entity_path(entity_id)}/{action}")
 
     def set_number(self, entity_id: str, value: int) -> None:
         self.logger(f"set number {object_id(entity_id)} = {value}")
-        self._control_request("POST", f"/number/{object_id(entity_id)}/set?value={value}")
+        self._control_request("POST", f"/{self.entity_path(entity_id)}/set?value={value}")
+
+    def entity_path(self, entity_id: str) -> str:
+        """Build the percent-encoded web API path for an entity seen on the stream.
+
+        ESPHome 2026.1 deprecated object-id URLs in favour of the entity-name
+        form, which every SSE payload already carries as name_id. quote keeps its
+        default safe='/', so a sub-device path such as 'number/Device/Entity'
+        stays three segments while spaces become %20. An entity that never
+        arrived on the stream raises rather than falling back to the deprecated
+        URL, which would only paper over the real failure.
+        """
+        entity = self.get_entity(entity_id)
+        if entity is None:
+            raise DeviceError(f"no entity with id '{entity_id}' was seen on the event stream")
+        return quote(entity.name_id)
 
     def get_entity(self, entity_id: str) -> Entity | None:
         with self._entities_lock:

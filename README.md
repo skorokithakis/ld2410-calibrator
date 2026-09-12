@@ -26,6 +26,8 @@ measure, so you can see what the radar sees.
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) on the machine that runs the script.
+- ESPHome 2026.1 or newer, because control requests use the entity-name web API
+  URLs that release introduced.
 - An ESPHome device with the `ld2410` component, `web_server:` enabled, and
   these entities exposed with names ending in the strings below:
   - switch: `Engineering Mode`
