@@ -5,6 +5,9 @@ radar behind an ESPHome device. It talks to the device only through the
 ESPHome built-in web server (REST plus server-sent events), so no extra
 firmware, broker, or API key is needed.
 
+![The calibration page on a phone, showing the live move and still energy of
+each gate against its current threshold](screenshot.png)
+
 ## What it does
 
 1. Connects to the device and turns engineering mode on, so per-gate
