@@ -86,15 +86,14 @@ class DeviceError(Exception):
 @dataclass
 class Entity:
     entity_id: str
-    name_id: str
     name: str
     value: float | bool | str | None
     state: str | None
 
 
 def object_id(entity_id: str) -> str:
-    """Strip the domain prefix, so log lines can name an entity briefly."""
-    return entity_id.split("-", 1)[1]
+    """Return the last entity-name segment for concise log lines."""
+    return entity_id.rsplit("/", 1)[1]
 
 
 def normalize_hostname(hostname: str) -> str:
@@ -102,18 +101,20 @@ def normalize_hostname(hostname: str) -> str:
     return hostname if hostname.startswith(("http://", "https://")) else f"http://{hostname}"
 
 
-def propose_threshold(empty_max: float, occupied_max: float) -> tuple[int, str]:
+def propose_threshold(
+    empty_max: float, occupied_max: float, margin: int = ENERGY_OFFSET
+) -> tuple[int, str]:
     """Pick a threshold from the empty and occupied energy maxima.
 
-    A fixed offset beats a multiplier here: near gates idle at 40 to 60 still
+    An additive margin beats a multiplier here: near gates idle at 40 to 60 still
     energy, so scaling the empty maximum would push the threshold to 100 and the
     radar would never trigger.
     """
-    if occupied_max > empty_max + ENERGY_OFFSET:
-        return min(100, int(empty_max) + ENERGY_OFFSET), "normal"
+    if occupied_max > empty_max + margin:
+        return min(100, int(empty_max) + margin), "normal"
     if occupied_max > empty_max:
         return min(100, round((empty_max + occupied_max) / 2)), "tight"
-    return min(100, int(empty_max) + ENERGY_OFFSET), "no detection"
+    return min(100, int(empty_max) + margin), "no detection"
 
 
 class Device:
@@ -178,9 +179,9 @@ class Device:
     def _handle_state(self, data: str) -> None:
         payload = json.loads(data)
         entity_id = payload["id"]
-        domain = entity_id.split("-", 1)[0]
-        # The initial dump carries "name", later updates do not, so log the
-        # first raw sample of each shape per domain.
+        domain = payload.get("domain") or entity_id.split("/", 1)[0]
+        # Initial dumps carry metadata including name and domain; later updates
+        # only carry id, value, and state, so log each shape once per domain.
         logged = self.logged_dumps if "name" in payload else self.logged_updates
         if domain not in logged:
             logged.add(domain)
@@ -190,9 +191,9 @@ class Device:
             known = self.entities.get(entity_id)
         name = payload.get("name")
         if name is None:
-            # The dump carries names but updates do not, so keep the name the
-            # entity was first discovered with, or derive it from name_id.
-            name = known.name if known is not None else payload["name_id"].split("/", 1)[1]
+            # Updates omit names, so retain the dump's name or derive the final
+            # entity-name segment when an update arrives before its dump.
+            name = known.name if known is not None else entity_id.rsplit("/", 1)[1]
         value = payload.get("value")
         if domain == "number" and isinstance(value, str):
             # Numbers arrive as strings ({"value":"50"}), switches send bool,
@@ -201,7 +202,6 @@ class Device:
             value = float(value)
         entity = Entity(
             entity_id=entity_id,
-            name_id=payload["name_id"],
             name=name,
             value=value,
             state=payload.get("state"),
@@ -227,17 +227,15 @@ class Device:
     def entity_path(self, entity_id: str) -> str:
         """Build the percent-encoded web API path for an entity seen on the stream.
 
-        ESPHome 2026.1 deprecated object-id URLs in favour of the entity-name
-        form, which every SSE payload already carries as name_id. quote keeps its
+        ESPHome 2026.8 SSE ids are already entity-name paths. quote keeps its
         default safe='/', so a sub-device path such as 'number/Device/Entity'
         stays three segments while spaces become %20. An entity that never
-        arrived on the stream raises rather than falling back to the deprecated
-        URL, which would only paper over the real failure.
+        arrived on the stream raises rather than falling back to a guessed URL.
         """
         entity = self.get_entity(entity_id)
         if entity is None:
             raise DeviceError(f"no entity with id '{entity_id}' was seen on the event stream")
-        return quote(entity.name_id)
+        return quote(entity.entity_id)
 
     def get_entity(self, entity_id: str) -> Entity | None:
         with self._entities_lock:
@@ -287,9 +285,12 @@ class Calibration:
         self.message: str | None = None
         self.room_length_metres = 0.0
         self.max_gate = MIN_GATE
+        self.margin = ENERGY_OFFSET
         self.device: Device | None = None
         self.cleaned_up = False
         self.gate_maxima: dict[str, float] = {}
+        self.sample_counts: dict[str, int] = {}
+        self.sample_rate: dict[str, float | str | int] | None = None
         self.results: list[dict[str, Any]] = []
         self.results_by_gate: dict[int, dict[str, Any]] = {}
         self.writes: list[dict[str, Any]] = []
@@ -322,10 +323,13 @@ class Calibration:
             self._close_device()
             self.room_length_metres = room_length_metres
             self.max_gate = max(MIN_GATE, min(MAX_GATE, math.ceil(room_length_metres / GATE_WIDTH_METRES)))
+            self.margin = ENERGY_OFFSET
             self.error_message = self.message = None
             self.cleaned_up = False
             self.engineering_switch_id = None
             self.gate_maxima = {}
+            self.sample_counts = {}
+            self.sample_rate = None
             self.results = []
             self.results_by_gate = {}
             self.writes = []
@@ -429,6 +433,7 @@ class Calibration:
             if time.monotonic() - started >= duration:
                 return
             key = f"{prefix}_{energy_type}_{gate}"
+            self.sample_counts[key] = self.sample_counts.get(key, 0) + 1
             if entity.value > self.gate_maxima.get(key, -1.0):
                 self.gate_maxima[key] = entity.value
 
@@ -490,7 +495,12 @@ class Calibration:
                     if missing:
                         failure = f"{self.phase} phase ended without samples for {', '.join(missing)}"
                     elif self.phase == PHASE_EMPTY:
-                        self.log(f"phase {PHASE_EMPTY} end: {self._maxima_line(prefix)}")
+                        sample_rate = self._empty_sample_rate(self.sample_counts)
+                        self.log(
+                            f"phase {PHASE_EMPTY} end: {self._maxima_line(prefix)}; "
+                            f"fastest gate {sample_rate['energy_type']} {sample_rate['gate']} "
+                            f"at {sample_rate['peak_per_second']:.1f} updates/s"
+                        )
                         self.phase = PHASE_WALK_READY
                         self.phase_started_at = None
                     elif self.phase == PHASE_WALK:
@@ -524,6 +534,39 @@ class Calibration:
                     self.phase = PHASE_RESULTS
                     self.phase_started_at = None
 
+    def skip(self) -> None:
+        with self.lock:
+            ready_phase = self.phase
+            if ready_phase not in (PHASE_WALK_READY, PHASE_STILL_READY):
+                return
+        # Building rows queries the device, so it cannot happen under the lock.
+        # The ready-phase check below prevents a concurrent poll from storing
+        # these rows after a disconnect or another skip changed the session.
+        results = self.compute_results()
+        with self.lock:
+            if self.phase == ready_phase:
+                self.results = results
+                self.results_by_gate = {row["gate"]: row for row in results}
+                self.phase = PHASE_RESULTS
+                self.phase_started_at = None
+
+    def set_margin(self, margin: Any) -> str | None:
+        if type(margin) is not int or not 0 <= margin <= 50:
+            return "Margin must be an integer from 0 to 50."
+        with self.lock:
+            if self.phase != PHASE_RESULTS:
+                return "Margin can only be changed while reviewing results."
+        # Building rows queries the device, so it cannot happen under the lock.
+        # Publishing the margin and its rows together keeps a poll from teaching
+        # the page that old rows belong to a newly selected margin.
+        results = self.compute_results(margin)
+        with self.lock:
+            if self.phase == PHASE_RESULTS:
+                self.margin = margin
+                self.results = results
+                self.results_by_gate = {row["gate"]: row for row in results}
+        return None
+
     def set_phase(self, phase: str, message: str | None = None) -> None:
         with self.lock:
             self.phase = phase
@@ -538,27 +581,53 @@ class Calibration:
             for energy_type in ("move", "still")
         )
 
-    def compute_results(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _empty_sample_rate(sample_counts: dict[str, int]) -> dict[str, float | str | int]:
+        # Sensors deduplicate unchanged values, so the busiest sensor reveals
+        # whether the device is publishing frames rather than remaining quiet.
+        peak_count, peak_energy_type, peak_gate = max(
+            (
+                (sample_counts.get(f"empty_{energy_type}_{gate}", 0), energy_type, gate)
+                for gate in range(GATE_COUNT)
+                for energy_type in ("move", "still")
+            ),
+            key=lambda sample: sample[0],
+        )
+        return {
+            "peak_per_second": peak_count / EMPTY_SECONDS,
+            "energy_type": peak_energy_type,
+            "gate": peak_gate,
+        }
+
+    def compute_results(self, margin: int | None = None) -> list[dict[str, Any]]:
         with self.lock:
             maxima, max_gate = dict(self.gate_maxima), self.max_gate
+            self.sample_rate = self._empty_sample_rate(self.sample_counts)
+            if margin is None:
+                margin = self.margin
         results: list[dict[str, Any]] = []
         for gate in range(GATE_COUNT):
             row: dict[str, Any] = {
                 "gate": gate,
                 "beyond": gate > max_gate,
-                "move": self._threshold_row("move", gate, maxima),
-                "still": self._threshold_row("still", gate, maxima) if gate >= STILL_GATE_START else None,
+                "move": self._threshold_row("move", gate, maxima, margin),
+                "still": self._threshold_row("still", gate, maxima, margin) if gate >= STILL_GATE_START else None,
             }
             results.append(row)
         return results
 
-    def _threshold_row(self, energy_type: str, gate: int, maxima: dict[str, float]) -> dict[str, Any]:
-        # advance_phase refuses to build results unless every one of these keys
-        # was sampled, so a missing key here is a bug and must not read as 0.
+    def _threshold_row(
+        self, energy_type: str, gate: int, maxima: dict[str, float], margin: int
+    ) -> dict[str, Any]:
+        # Empty-room samples are required before either route can build results;
+        # occupied samples are deliberately absent when the user skips ahead.
         empty_max = maxima[f"empty_{energy_type}_{gate}"]
         occupied_prefix = "walk" if energy_type == "move" else "still"
-        occupied_max = maxima[f"{occupied_prefix}_{energy_type}_{gate}"]
-        proposed, status = propose_threshold(empty_max, occupied_max)
+        occupied_max = maxima.get(f"{occupied_prefix}_{energy_type}_{gate}")
+        if occupied_max is None:
+            proposed, status = min(100, int(empty_max) + margin), "empty only"
+        else:
+            proposed, status = propose_threshold(empty_max, occupied_max, margin)
         current = self.device.get_value(self.gate_ids[f"{energy_type}_threshold"][gate])
         return {
             "current": current,
@@ -568,10 +637,29 @@ class Calibration:
             "status": status,
         }
 
-    def start_writing(self) -> None:
+    def start_writing(self, thresholds: Any = None) -> str | None:
+        replacements: list[tuple[int, str, int]] = []
+        if thresholds is not None:
+            if not isinstance(thresholds, dict):
+                return "Thresholds must be an object."
+            for gate_key, values in thresholds.items():
+                try:
+                    gate = int(gate_key)
+                except (TypeError, ValueError):
+                    return f"Invalid gate: {gate_key!r}."
+                if gate not in range(GATE_COUNT) or not isinstance(values, dict):
+                    return f"Invalid threshold for gate {gate_key!r}."
+                for energy_type, value in values.items():
+                    if energy_type not in ("move", "still") or (energy_type == "still" and gate < STILL_GATE_START):
+                        return f"Invalid threshold type for gate {gate}."
+                    if type(value) is not int or not 0 <= value <= 100:
+                        return f"Gate {gate} {energy_type} threshold must be an integer from 0 to 100."
+                    replacements.append((gate, energy_type, value))
         with self.lock:
             if self.phase != PHASE_RESULTS:
-                return
+                return None
+            for gate, energy_type, value in replacements:
+                self.results_by_gate[gate][energy_type]["proposed"] = value
             self.writes = []
             self.write_index = {}
             for gate in range(GATE_COUNT):
@@ -592,6 +680,7 @@ class Calibration:
             self.phase = PHASE_WRITING
             self.phase_started_at = None
         threading.Thread(target=self._write_all, daemon=True).start()
+        return None
 
     def _add_write(self, label: str, entity_id: str, target: int) -> None:
         record: dict[str, Any] = {"label": label, "target": target, "actual": None, "verified": None}
@@ -713,12 +802,14 @@ class Calibration:
                 "message": self.message,
                 "room_length_metres": self.room_length_metres,
                 "max_gate": self.max_gate,
+                "margin": self.margin,
                 "timeout_seconds": TIMEOUT_SECONDS,
                 "phase_duration_seconds": duration,
                 "phase_elapsed_seconds": elapsed,
                 "phase_remaining_seconds": max(0.0, duration - elapsed) if duration else 0.0,
                 "gates": [],
                 "results": self.results,
+                "sample_rate": self.sample_rate if self.results else None,
                 "writes": [dict(record) for record in self.writes],
                 "verified_count": sum(1 for record in self.writes if record["verified"] is True),
                 "write_count": len(self.writes),
@@ -746,8 +837,7 @@ PAGE = """<!doctype html>
 <title>LD2410 calibration</title>
 <!-- An empty data URI stops the browser asking for /favicon.ico, which the
      server has no answer for. Declaring it here rather than adding a route
-     means there is no request at all, and _send_bytes keeps its single
-     hardcoded 200 status instead of growing a 204 case for one icon. -->
+     means there is no request at all. -->
 <link rel="icon" href="data:,">
 <style>
 :root { color-scheme: dark; }
@@ -758,6 +848,7 @@ h1 { font-size: 1.25rem; } h2 { font-size: 1.05rem; margin: 0 0 8px; }
 section, details { margin-top: 16px; } .hidden { display: none; }
 label { display: block; margin-top: 12px; }
 input { width: 100%; font-size: 1.1rem; padding: 12px; border-radius: 8px; border: 1px solid #555; background: #1c1c1c; color: #eee; }
+.threshold-input { display: inline-block; width: 5rem; font-size: .95rem; padding: 3px 5px; }
 button { font-size: 1.15rem; padding: 15px 18px; border-radius: 10px; border: 0; background: #2f6df6; color: #fff; width: 100%; margin-top: 10px; }
 button.secondary { background: #444; } button:disabled { opacity: .5; }
 .muted { color: #aaa; font-size: .9rem; } .error { color: #ff6b6b; }
@@ -816,6 +907,7 @@ pre { margin: 6px 0 0; max-height: 40vh; overflow: auto; white-space: pre-wrap; 
 <section id="writes"></section>
 <section id="actions">
   <button id="startButton" class="hidden">Start</button>
+  <button id="skipButton" class="secondary hidden">Skip to results</button>
   <button id="writeButton" class="hidden">Write to radar</button>
   <button id="cancelButton" class="secondary hidden">Cancel</button>
 </section>
@@ -841,8 +933,11 @@ const instructions = {
 const statusWords = {
   normal: "normal",
   tight: "tight: a person here is only just above noise.",
-  "no detection": "no person seen here."
+  "no detection": "no person seen here.",
+  "empty only": "empty only"
 };
+// A little slack above one update per second avoids warning on timing jitter.
+const THROTTLED_GATE_SAMPLE_RATE = 1.5;
 const byId = (id) => document.getElementById(id);
 const show = (id, on) => byId(id).classList.toggle("hidden", !on);
 const post = (path, body) => fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
@@ -916,10 +1011,11 @@ function renderGates(status) {
     status.gates.map((gate) => gateRow(gate, status.max_gate)).join("") + "</div>";
 }
 
-function thresholdRow(name, data) {
+function thresholdRow(name, gate, data, disabled) {
   if (!data) { return ""; }
   const word = statusWords[data.status] || data.status;
-  return `<div class="muted">${name}: now ${data.current} - propose <strong>${data.proposed}</strong> (empty ${data.empty_max}, occupied ${data.occupied_max}) - ${word}</div>`;
+  const occupied = data.occupied_max ?? "-";
+  return `<div class="muted">${name}: now ${data.current} - propose <input class="threshold-input" type="number" min="0" max="100" step="1" value="${data.proposed}" data-gate="${gate}" data-energy="${name}" aria-label="Gate ${gate} ${name} threshold"${disabled ? " disabled" : ""}> (empty ${data.empty_max}, occupied ${occupied}) - ${word}</div>`;
 }
 
 function renderResults(status) {
@@ -927,11 +1023,40 @@ function renderResults(status) {
     byId("results").innerHTML = ""; return;
   }
   const gates = status.results.map((row) =>
-    `<div class="gate"><strong>Gate ${row.gate}</strong>${row.beyond ? ' <span class="muted">beyond room, ignored by module</span>' : ""}${thresholdRow("move", row.move)}${thresholdRow("still", row.still)}</div>`
+    `<div class="gate"><strong>Gate ${row.gate}</strong>${row.beyond ? ' <span class="muted">beyond room, ignored by module</span>' : ""}${thresholdRow("move", row.gate, row.move, status.phase === "writing")}${thresholdRow("still", row.gate, row.still, status.phase === "writing")}</div>`
   ).join("");
-  byId("results").innerHTML = "<h2>Proposed thresholds</h2>" + gates +
-    `<p class="muted">Timeout: ${status.timeout_seconds} s. Max gate: ${status.max_gate} (room ${status.room_length_metres} m / 0.75 m per gate, clamped to 2-8).</p>
+  const hasEmptyOnly = status.results.some((row) => [row.move, row.still].some((data) => data && data.status === "empty only"));
+  const sampleRate = status.sample_rate;
+  const sampleRateMessage = sampleRate.peak_per_second <= THROTTLED_GATE_SAMPLE_RATE
+    ? `<p class="error">Fastest gate published ${sampleRate.peak_per_second.toFixed(1)} updates/s (gate ${sampleRate.gate} ${sampleRate.energy_type}). The device publishes gate energies about once per second (ESPHome's default <code>throttle_with_priority: 1000ms</code>); the radar updates 10 or more times per second, so the empty-room peaks are under-sampled and the thresholds will be too low. Add <code>filters: []</code> to every gX <code>move_energy</code> and <code>still_energy</code> sensor in the device YAML and recalibrate.</p>`
+    : `<p class="muted">Fastest gate published ${sampleRate.peak_per_second.toFixed(1)} updates/s (gate ${sampleRate.gate} ${sampleRate.energy_type})</p>`;
+  byId("results").innerHTML = `<h2>Proposed thresholds</h2>
+    <label for="margin">Margin above empty peak</label>
+    <input id="margin" type="number" min="0" max="50" step="1" value="${status.margin}"${status.phase === "writing" ? " disabled" : ""}>` + gates +
+    (hasEmptyOnly ? '<p class="muted">Rows marked empty only were not measured with a person present. Their thresholds are the empty-room peak plus the margin.</p>' : "") +
+    sampleRateMessage +
+    `<p class="muted">Margin: ${status.margin}. Timeout: ${status.timeout_seconds} s. Max gate: ${status.max_gate} (room ${status.room_length_metres} m / 0.75 m per gate, clamped to 2-8).</p>
      <p class="muted">Write sends each proposed value to the radar. The radar stores them in its own flash, so reflashing the ESP does not undo them. The Factory Reset button in the device web UI restores the defaults.</p>`;
+  if (status.phase === "results") {
+    byId("margin").onchange = async () => {
+      // A counter, not a flag: two quick changes overlap, and the first to
+      // finish must not re-enable Write while the second is still in flight.
+      marginPending += 1;
+      byId("writeButton").disabled = true;
+      try {
+        const response = await post("/margin", { margin: byId("margin").valueAsNumber });
+        if (!response.ok) {
+          const payload = await response.json();
+          alert(payload.message || "Could not change the margin.");
+        }
+        await poll();
+      } finally {
+        marginPending -= 1;
+        if (!marginPending && lastRenderedPhase === "results") { byId("writeButton").disabled = false; }
+      }
+    };
+  }
+  lastRenderedMargin = status.margin;
 }
 
 function renderWrites(status) {
@@ -960,12 +1085,18 @@ function render(status) {
     byId("progressBar").style.width = `${Math.min(100, 100 * status.phase_elapsed_seconds / status.phase_duration_seconds)}%`;
     byId("progressText").textContent = `${Math.ceil(status.phase_remaining_seconds)} s left`;
   }
-  renderGates(status); renderResults(status); renderWrites(status);
+  renderGates(status);
+  if (status.phase !== lastRenderedPhase || (status.phase === "results" && status.margin !== lastRenderedMargin)) {
+    renderResults(status);
+  }
+  renderWrites(status);
   byId("logView").textContent = (status.log || []).join("\\n");
   show("startButton", ["empty_ready", "walk_ready", "still_ready"].includes(status.phase));
+  show("skipButton", ["walk_ready", "still_ready"].includes(status.phase));
   show("writeButton", status.phase === "results");
   show("cancelButton", !["setup", "connecting", "writing", "done", "error"].includes(status.phase));
-  if (status.phase !== "writing") { byId("writeButton").disabled = false; }
+  if (status.phase !== "writing" && !marginPending) { byId("writeButton").disabled = false; }
+  lastRenderedPhase = status.phase;
 }
 
 async function poll() {
@@ -987,10 +1118,28 @@ const params = new URLSearchParams(location.search);
 if (params.has("address")) { byId("hostname").value = params.get("address"); }
 if (params.has("length")) { byId("roomLength").value = params.get("length"); }
 let autoConnect = params.has("address");
+let lastRenderedPhase;
+let lastRenderedMargin;
+let marginPending = 0;
 byId("connectButton").onclick = connect;
 byId("startButton").onclick = () => post("/start");
+byId("skipButton").onclick = () => post("/skip");
 byId("cancelButton").onclick = () => post("/cancel");
-byId("writeButton").onclick = () => { byId("writeButton").disabled = true; return post("/write"); };
+byId("writeButton").onclick = async () => {
+  if (marginPending) { return; }
+  const thresholds = {};
+  document.querySelectorAll("#results .threshold-input").forEach((input) => {
+    const gate = input.dataset.gate;
+    (thresholds[gate] ||= {})[input.dataset.energy] = input.valueAsNumber;
+  });
+  byId("writeButton").disabled = true;
+  const response = await post("/write", { thresholds });
+  if (!response.ok) {
+    const payload = await response.json();
+    byId("writeButton").disabled = false;
+    alert(payload.message || "Could not write thresholds.");
+  }
+};
 byId("copyLogButton").onclick = async () => {
   await navigator.clipboard.writeText(byId("logView").textContent);
   byId("copyLogButton").textContent = "Copied";
@@ -1026,20 +1175,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.app.connect(str(payload["hostname"]), float(payload["room_length_metres"]))
         elif path == "/start":
             self.app.start_phase()
+        elif path == "/skip":
+            self.app.skip()
+        elif path == "/margin":
+            error = self.app.set_margin(payload.get("margin"))
+            if error is not None:
+                self._send_json({"ok": False, "message": error}, status=400)
+                return
         elif path == "/cancel":
             self.app.cancel()
         elif path == "/write":
-            self.app.start_writing()
+            error = self.app.start_writing(payload.get("thresholds"))
+            if error is not None:
+                self._send_json({"ok": False, "message": error}, status=400)
+                return
         else:
             self.send_error(404)
             return
         self._send_json({"ok": True})
 
-    def _send_json(self, payload: dict[str, Any]) -> None:
-        self._send_bytes(json.dumps(payload).encode("utf-8"), "application/json")
+    def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        self._send_bytes(json.dumps(payload).encode("utf-8"), "application/json", status)
 
-    def _send_bytes(self, body: bytes, content_type: str) -> None:
-        self.send_response(200)
+    def _send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
